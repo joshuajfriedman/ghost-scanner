@@ -275,18 +275,32 @@ async function classifyMissing(did) {
 }
 
 // Active labels from the Bluesky Moderation Service for a batch of DIDs.
-// Labels arrive in chronological order; a later `neg: true` entry cancels a label.
+// A later `neg: true` entry cancels a label, so the full stream must be
+// fetched (cursor pagination) before replaying it in cts order — a negation
+// falling past a page cap would otherwise resurrect a retracted label.
+// The labeler returns a cursor even on the last page of data; the follow-up
+// call comes back as an empty `labels` array with no cursor.
 async function queryModLabels(dids) {
-  const u = new URL(MOD_LABELER + "/com.atproto.label.queryLabels");
-  for (const d of dids) u.searchParams.append("uriPatterns", d);
-  u.searchParams.set("limit", "250");
-  const res = await fetchJSON(u.toString());
+  const all = [];
+  let cursor = null;
+  for (;;) {
+    const u = new URL(MOD_LABELER + "/com.atproto.label.queryLabels");
+    for (const d of dids) u.searchParams.append("uriPatterns", d);
+    u.searchParams.set("limit", "250");
+    if (cursor) u.searchParams.set("cursor", cursor);
+    const res = await fetchJSON(u.toString());
+    const page = res.labels || [];
+    all.push(...page);
+    if (!res.cursor || res.cursor === cursor || page.length === 0) break;
+    cursor = res.cursor;
+  }
+  const now = new Date().toISOString();
   const active = new Map(); // did -> Set(labelValue)
-  const sorted = (res.labels || []).slice().sort((a, b) => (a.cts < b.cts ? -1 : 1));
-  for (const l of sorted) {
+  all.sort((a, b) => (a.cts < b.cts ? -1 : 1));
+  for (const l of all) {
     if (!active.has(l.uri)) active.set(l.uri, new Set());
     if (l.neg) active.get(l.uri).delete(l.val);
-    else active.get(l.uri).add(l.val);
+    else if (!l.exp || l.exp > now) active.get(l.uri).add(l.val);
   }
   return active;
 }
@@ -368,9 +382,11 @@ async function scan() {
     }), 6, (done, total) => setProgress(0.7 + 0.3 * (done / total)));
 
     // Second signal: labels the AppView hydrated onto profiles from the mod service
+    const nowIso = new Date().toISOString();
     for (const [did, p] of alive) {
       for (const l of p.labels || []) {
         if (l.src !== BSKY_MOD_DID || l.neg) continue;
+        if (l.exp && l.exp <= nowIso) continue; // expired labels are dead
         if (!labelsByDid.has(did)) labelsByDid.set(did, new Set());
         labelsByDid.get(did).add(l.val);
       }
